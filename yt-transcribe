@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Download and transcribe a YouTube video with faster-whisper.
+
+Fetches audio via yt-dlp, transcribes with word-level timestamps,
+and outputs both a JSON transcript and an Obsidian-compatible Markdown file.
+
+Usage:
+    yt-transcribe <url> [--model MODEL] [--language LANG] [--vault-dir DIR] [--no-vault] [--output DIR]
+"""
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+VAULT_ROOT = Path.home() / "obsidian" / "vault"
+DEFAULT_VAULT_DIR = "Transcripts"
+DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_LANGUAGE = "en"
+
+# Terminal colors
+CYAN = "\033[0;36m"
+GREEN = "\033[0;32m"
+RED = "\033[0;31m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+# ── Dependency checks ────────────────────────────────────────────────────────
+
+def check_deps():
+    """Verify required tools and libraries are available."""
+    missing = []
+
+    if not shutil.which("ffmpeg"):
+        missing.append("ffmpeg")
+
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        missing.append("yt-dlp (pip install yt-dlp)")
+
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        missing.append("faster-whisper (pip install faster-whisper)")
+
+    if missing:
+        print(f"{RED}Missing dependencies:{RESET} {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Download and transcribe a YouTube video with faster-whisper",
+    )
+    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help=f"Whisper model name (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--language", default=DEFAULT_LANGUAGE,
+        help=f"Language code (default: {DEFAULT_LANGUAGE})",
+    )
+    parser.add_argument(
+        "--vault-dir", default=DEFAULT_VAULT_DIR,
+        help=f"Subdirectory inside Obsidian vault (default: {DEFAULT_VAULT_DIR})",
+    )
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--no-vault", action="store_true",
+        help="Write output to current directory instead of Obsidian vault",
+    )
+    output_group.add_argument(
+        "--output", type=str, default=None,
+        help="Explicit output directory (overrides vault)",
+    )
+    return parser.parse_args()
+
+
+# ── YouTube metadata and download ────────────────────────────────────────────
+
+def fetch_metadata(url):
+    """Extract video metadata without downloading."""
+    import yt_dlp
+
+    print(f"{DIM}Fetching metadata...{RESET}", file=sys.stderr)
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    duration = info.get("duration", 0)
+    hours = duration // 3600
+    minutes = (duration % 3600) // 60
+    seconds = duration % 60
+    if hours > 0:
+        duration_str = f"{hours}h{minutes:02d}m{seconds:02d}s"
+    else:
+        duration_str = f"{minutes}m{seconds:02d}s"
+
+    upload_date = info.get("upload_date", "")
+    if upload_date and len(upload_date) == 8:
+        date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+    else:
+        from datetime import date
+        date_str = date.today().isoformat()
+
+    meta = {
+        "title": info.get("title", "Untitled"),
+        "channel": info.get("channel", info.get("uploader", "Unknown")),
+        "duration": duration,
+        "duration_str": duration_str,
+        "date": date_str,
+        "url": url,
+        "id": info.get("id", ""),
+    }
+
+    print(f"  {BOLD}{meta['title']}{RESET}", file=sys.stderr)
+    print(f"  {DIM}{meta['channel']} | {meta['duration_str']} | {meta['date']}{RESET}", file=sys.stderr)
+
+    return meta
+
+
+def download_audio(url, tmp_dir):
+    """Download audio from YouTube and convert to 16kHz mono WAV."""
+    import yt_dlp
+
+    print(f"\n{DIM}Downloading audio...{RESET}", file=sys.stderr)
+
+    raw_audio = str(Path(tmp_dir) / "audio.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": raw_audio,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    # Find the downloaded file (extension varies)
+    downloaded = list(Path(tmp_dir).glob("audio.*"))
+    if not downloaded:
+        print(f"{RED}Error: no audio file downloaded{RESET}", file=sys.stderr)
+        sys.exit(1)
+    raw_path = downloaded[0]
+
+    # Convert to 16kHz mono WAV for faster-whisper
+    wav_path = str(Path(tmp_dir) / "audio_16k.wav")
+    print(f"{DIM}Converting to 16kHz WAV...{RESET}", file=sys.stderr)
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(raw_path),
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            wav_path, "-loglevel", "error",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"{RED}Error converting audio:{RESET} {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    return wav_path
+
+
+# ── Transcription ────────────────────────────────────────────────────────────
+
+def format_ts(seconds):
+    """Convert seconds to HH:MM:SS,mmm format (for JSON timestamps)."""
+    ms = int(seconds * 1000)
+    total_s = ms // 1000
+    ms_rem = ms % 1000
+    m, s = divmod(total_s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms_rem:03d}"
+
+
+def format_ts_short(seconds):
+    """Convert seconds to HH:MM:SS format (for markdown headers)."""
+    total_s = int(seconds)
+    m, s = divmod(total_s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def transcribe(wav_path, model_name, language):
+    """Transcribe audio with faster-whisper, returning the result dict."""
+    from faster_whisper import WhisperModel
+
+    print(f"\n{DIM}Loading model: {model_name}...{RESET}", file=sys.stderr)
+    model = WhisperModel(model_name, device="auto", compute_type="auto")
+
+    print(f"{DIM}Transcribing...{RESET}", file=sys.stderr)
+    segments_gen, info = model.transcribe(
+        wav_path,
+        language=language,
+        word_timestamps=True,
+        vad_filter=True,
+    )
+
+    transcription = []
+
+    for segment in segments_gen:
+        from_ms = round(segment.start * 1000)
+        to_ms = round(segment.end * 1000)
+
+        words = []
+        if segment.words:
+            for w in segment.words:
+                words.append({
+                    "word": w.word.strip(),
+                    "start": round(w.start * 1000),
+                    "end": round(w.end * 1000),
+                })
+
+        transcription.append({
+            "timestamps": {
+                "from": format_ts(segment.start),
+                "to": format_ts(segment.end),
+            },
+            "offsets": {
+                "from": from_ms,
+                "to": to_ms,
+            },
+            "text": segment.text,
+            "words": words,
+            # Temporary fields for markdown generation (cleaned before JSON save)
+            "start_seconds": segment.start,
+            "end_seconds": segment.end,
+        })
+
+        print(
+            f"  [{format_ts(segment.start)} -> {format_ts(segment.end)}]{segment.text}",
+            file=sys.stderr,
+        )
+
+    result = {
+        "params": {
+            "model": model_name,
+            "language": language,
+        },
+        "result": {
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "duration": info.duration,
+        },
+        "transcription": transcription,
+    }
+
+    print(
+        f"\n{GREEN}Transcribed {len(transcription)} segments{RESET}",
+        file=sys.stderr,
+    )
+
+    return result
+
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+
+def resolve_output_dir(args):
+    """Determine the output directory from CLI args."""
+    if args.output:
+        return Path(args.output)
+    if args.no_vault:
+        return Path.cwd()
+    return VAULT_ROOT / args.vault_dir
+
+
+def sanitize_filename(title):
+    """Strip unsafe characters from a filename and limit length."""
+    # Remove characters that are problematic in filenames
+    cleaned = re.sub(r'[<>:"/\\|?*]', "", title)
+    # Collapse whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Limit length
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200].rstrip()
+    return cleaned
+
+
+# ── Obsidian Markdown generation ─────────────────────────────────────────────
+
+def generate_markdown(meta, result, model_name):
+    """Build an Obsidian-compatible Markdown document from transcript data."""
+    lines = []
+
+    # YAML frontmatter
+    lines.append("---")
+    lines.append(f"title: \"{meta['title']}\"")
+    lines.append(f"url: {meta['url']}")
+    lines.append(f"channel: \"{meta['channel']}\"")
+    lines.append(f"date: {meta['date']}")
+    lines.append(f"duration: {meta['duration_str']}")
+    lines.append(f"model: {model_name}")
+    lines.append("tags:")
+    lines.append("  - transcript")
+    lines.append("  - youtube")
+    lines.append("---")
+    lines.append("")
+
+    # Title
+    lines.append(f"# {meta['title']}")
+    lines.append("")
+
+    # Transcript sections
+    for seg in result["transcription"]:
+        start = seg["start_seconds"]
+        end = seg["end_seconds"]
+        ts_label = f"{format_ts_short(start)} - {format_ts_short(end)}"
+        lines.append(f"## {ts_label}")
+        lines.append("")
+        lines.append(seg["text"].strip())
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    check_deps()
+    print(f"{BOLD}{CYAN}yt-transcribe{RESET}", file=sys.stderr)
+
+    meta = fetch_metadata(args.url)
+
+    output_dir = resolve_output_dir(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_name = sanitize_filename(meta["title"])
+
+    tmp_dir = tempfile.mkdtemp(prefix="yt_transcribe_")
+    try:
+        wav_path = download_audio(args.url, tmp_dir)
+        result = transcribe(wav_path, args.model, args.language)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Generate markdown (needs start_seconds/end_seconds)
+    md_content = generate_markdown(meta, result, args.model)
+
+    # Clean internal fields before saving JSON
+    for seg in result["transcription"]:
+        seg.pop("start_seconds", None)
+        seg.pop("end_seconds", None)
+
+    # Save JSON
+    json_path = output_dir / f"{base_name}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent="\t", ensure_ascii=False)
+    print(f"\n{GREEN}Wrote JSON:{RESET} {json_path}", file=sys.stderr)
+
+    # Save Markdown
+    md_path = output_dir / f"{base_name}.md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_content)
+    print(f"{GREEN}Wrote Markdown:{RESET} {md_path}", file=sys.stderr)
+
+    print(f"\n{BOLD}Done!{RESET}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
