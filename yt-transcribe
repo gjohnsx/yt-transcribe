@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/gregjohns/code/personal/yt-transcribe/.venv/bin/python3.12
 """Download and transcribe a YouTube video with faster-whisper.
 
 Fetches audio via yt-dlp, transcribes with word-level timestamps,
@@ -101,6 +101,10 @@ def fetch_metadata(url):
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "cookiesfrombrowser": ("chrome",),
+        "ignore_no_formats_error": True,
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -150,6 +154,9 @@ def download_audio(url, tmp_dir):
         "outtmpl": raw_audio,
         "quiet": True,
         "no_warnings": True,
+        "cookiesfrombrowser": ("chrome",),
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
