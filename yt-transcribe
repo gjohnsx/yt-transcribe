@@ -77,6 +77,18 @@ def parse_args():
         "--vault-dir", default=DEFAULT_VAULT_DIR,
         help=f"Subdirectory inside Obsidian vault (default: {DEFAULT_VAULT_DIR})",
     )
+    parser.add_argument(
+        "--diarize", action="store_true",
+        help="Enable speaker diarization (requires pyannote.audio + HuggingFace token)",
+    )
+    parser.add_argument(
+        "--speakers", type=int, default=None,
+        help="Expected number of speakers (helps diarization accuracy)",
+    )
+    parser.add_argument(
+        "--hf-token", type=str, default=None,
+        help="HuggingFace token for pyannote (or set HF_TOKEN env var)",
+    )
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument(
         "--no-vault", action="store_true",
@@ -280,6 +292,71 @@ def transcribe(wav_path, model_name, language):
     return result
 
 
+# ── Speaker diarization ──────────────────────────────────────────────────────
+
+def diarize(wav_path, hf_token, num_speakers=None):
+    """Run pyannote speaker diarization, return list of speaker segments."""
+    import torch
+    from pyannote.audio import Pipeline
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"\n{DIM}Loading diarization model (device: {device})...{RESET}", file=sys.stderr)
+
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=hf_token,
+    )
+    pipeline.to(torch.device(device))
+
+    print(f"{DIM}Diarizing...{RESET}", file=sys.stderr)
+    kwargs = {}
+    if num_speakers is not None:
+        kwargs["num_speakers"] = num_speakers
+
+    annotation = pipeline(wav_path, **kwargs)
+
+    speaker_segments = []
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
+        speaker_segments.append({
+            "start": turn.start,
+            "end": turn.end,
+            "speaker": speaker,
+        })
+
+    # Count unique speakers
+    speakers = set(s["speaker"] for s in speaker_segments)
+    print(f"{GREEN}Found {len(speakers)} speakers{RESET}", file=sys.stderr)
+
+    return speaker_segments
+
+
+def assign_speakers(result, speaker_segments):
+    """Assign speaker labels to transcript segments and words via max overlap."""
+    def find_speaker(start_s, end_s):
+        best_speaker = None
+        best_overlap = 0.0
+        for sp in speaker_segments:
+            overlap_start = max(start_s, sp["start"])
+            overlap_end = min(end_s, sp["end"])
+            overlap = max(0.0, overlap_end - overlap_start)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = sp["speaker"]
+        return best_speaker
+
+    for seg in result["transcription"]:
+        seg_start = seg["offsets"]["from"] / 1000.0
+        seg_end = seg["offsets"]["to"] / 1000.0
+        seg["speaker"] = find_speaker(seg_start, seg_end)
+
+        for word in seg.get("words", []):
+            word_start = word["start"] / 1000.0
+            word_end = word["end"] / 1000.0
+            word["speaker"] = find_speaker(word_start, word_end)
+
+    return result
+
+
 # ── Output helpers ───────────────────────────────────────────────────────────
 
 def resolve_output_dir(args):
@@ -328,13 +405,21 @@ def generate_markdown(meta, result, model_name):
     lines.append("")
 
     # Transcript sections
+    has_speakers = any(seg.get("speaker") for seg in result["transcription"])
+    prev_speaker = None
+
     for seg in result["transcription"]:
         start = seg["start_seconds"]
         end = seg["end_seconds"]
-        ts_label = f"{format_ts_short(start)} - {format_ts_short(end)}"
-        lines.append(f"## {ts_label}")
-        lines.append("")
-        lines.append(seg["text"].strip())
+        speaker = seg.get("speaker")
+        text = seg["text"].strip()
+
+        if has_speakers and speaker and speaker != prev_speaker:
+            lines.append(f"### {speaker}")
+            lines.append("")
+            prev_speaker = speaker
+
+        lines.append(f"**{format_ts_short(start)}** {text}")
         lines.append("")
 
     return "\n".join(lines)
@@ -353,10 +438,24 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     base_name = sanitize_filename(meta["title"])
 
+    # Resolve HF token for diarization
+    hf_token = None
+    if args.diarize:
+        import os
+        hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+        if not hf_token:
+            print(f"{RED}Diarization requires a HuggingFace token.{RESET}", file=sys.stderr)
+            print(f"{DIM}Pass --hf-token TOKEN or set HF_TOKEN env var.{RESET}", file=sys.stderr)
+            print(f"{DIM}Get one at: https://huggingface.co/settings/tokens{RESET}", file=sys.stderr)
+            sys.exit(1)
+
     tmp_dir = tempfile.mkdtemp(prefix="yt_transcribe_")
     try:
         wav_path = download_audio(args.url, tmp_dir)
         result = transcribe(wav_path, args.model, args.language)
+        if args.diarize:
+            speaker_segments = diarize(wav_path, hf_token, args.speakers)
+            result = assign_speakers(result, speaker_segments)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
