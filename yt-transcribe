@@ -304,7 +304,7 @@ def diarize(wav_path, hf_token, num_speakers=None):
 
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
+        token=hf_token,
     )
     pipeline.to(torch.device(device))
 
@@ -313,7 +313,10 @@ def diarize(wav_path, hf_token, num_speakers=None):
     if num_speakers is not None:
         kwargs["num_speakers"] = num_speakers
 
-    annotation = pipeline(wav_path, **kwargs)
+    result = pipeline(wav_path, **kwargs)
+
+    # pyannote >= 3.1 returns DiarizeOutput with .speaker_diarization attribute
+    annotation = result if hasattr(result, "itertracks") else result.speaker_diarization
 
     speaker_segments = []
     for turn, _, speaker in annotation.itertracks(yield_label=True):
