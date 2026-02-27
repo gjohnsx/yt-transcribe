@@ -105,6 +105,14 @@ Override with:
 - `--no-vault` to write to current directory
 - `--output <dir>` to write to a specific directory
 
+## Example ElevenLabs Output
+
+Real example output files are included in [`examples/elevenlabs`](./examples/elevenlabs):
+
+- [Markdown transcript](./examples/elevenlabs/openclaw-builders-unscripted.md)
+- [Normalized JSON transcript](./examples/elevenlabs/openclaw-builders-unscripted.json)
+- [Raw ElevenLabs response JSON](./examples/elevenlabs/openclaw-builders-unscripted.elevenlabs.raw.json)
+
 ## Notes
 
 - This script currently requests YouTube cookies from local Chrome via `yt-dlp` (`cookiesfrombrowser`).

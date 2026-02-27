@@ -26,3 +26,4 @@ venv/
 
 # Generated provider payload dumps
 *.elevenlabs.raw.json
+!examples/elevenlabs/*.elevenlabs.raw.json
