@@ -1,15 +1,19 @@
-#!/Users/gregjohns/code/personal/yt-transcribe/.venv/bin/python3.12
-"""Download and transcribe a YouTube video with faster-whisper.
+#!/usr/bin/env python3
+"""Download and transcribe a video URL.
 
 Fetches audio via yt-dlp, transcribes with word-level timestamps,
 and outputs both a JSON transcript and an Obsidian-compatible Markdown file.
 
 Usage:
-    yt-transcribe <url> [--model MODEL] [--language LANG] [--vault-dir DIR] [--no-vault] [--output DIR]
+    yt-transcribe <url> [--provider PROVIDER] [--model MODEL] [--language LANG]
+                  [--start TIME] [--end TIME]
+                  [--vault-dir DIR] [--no-vault] [--output DIR]
 """
 
 import argparse
+import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,7 +26,58 @@ from pathlib import Path
 VAULT_ROOT = Path.home() / "obsidian" / "vault"
 DEFAULT_VAULT_DIR = "Transcripts"
 DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_ELEVENLABS_MODEL = "scribe_v2"
 DEFAULT_LANGUAGE = "en"
+DEFAULT_PROVIDER = "faster-whisper"
+
+ELEVENLABS_LANGUAGE_MAP = {
+    "af": "afr",
+    "ar": "ara",
+    "bg": "bul",
+    "bn": "ben",
+    "ca": "cat",
+    "cs": "ces",
+    "da": "dan",
+    "de": "deu",
+    "el": "ell",
+    "en": "eng",
+    "es": "spa",
+    "et": "est",
+    "fa": "fas",
+    "fi": "fin",
+    "fr": "fra",
+    "he": "heb",
+    "hi": "hin",
+    "hr": "hrv",
+    "hu": "hun",
+    "id": "ind",
+    "it": "ita",
+    "ja": "jpn",
+    "ko": "kor",
+    "lt": "lit",
+    "lv": "lav",
+    "mk": "mkd",
+    "ms": "msa",
+    "nl": "nld",
+    "no": "nor",
+    "pl": "pol",
+    "pt": "por",
+    "ro": "ron",
+    "ru": "rus",
+    "sk": "slk",
+    "sl": "slv",
+    "sr": "srp",
+    "sv": "swe",
+    "sw": "swa",
+    "ta": "tam",
+    "te": "tel",
+    "th": "tha",
+    "tr": "tur",
+    "uk": "ukr",
+    "ur": "urd",
+    "vi": "vie",
+    "zh": "zho",
+}
 
 # Terminal colors
 CYAN = "\033[0;36m"
@@ -35,7 +90,7 @@ RESET = "\033[0m"
 
 # ── Dependency checks ────────────────────────────────────────────────────────
 
-def check_deps():
+def check_deps(provider, diarize_enabled=False):
     """Verify required tools and libraries are available."""
     missing = []
 
@@ -47,14 +102,85 @@ def check_deps():
     except ImportError:
         missing.append("yt-dlp (pip install yt-dlp)")
 
-    try:
-        import faster_whisper  # noqa: F401
-    except ImportError:
-        missing.append("faster-whisper (pip install faster-whisper)")
+    if provider == "faster-whisper":
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            missing.append("faster-whisper (pip install faster-whisper)")
+        if diarize_enabled:
+            try:
+                import torch  # noqa: F401
+            except ImportError:
+                missing.append("torch (pip install torch)")
+            try:
+                from pyannote.audio import Pipeline  # noqa: F401
+            except ImportError:
+                missing.append("pyannote.audio (pip install pyannote.audio)")
+    else:
+        try:
+            import elevenlabs  # noqa: F401
+        except ImportError:
+            missing.append("elevenlabs (pip install elevenlabs)")
 
     if missing:
         print(f"{RED}Missing dependencies:{RESET} {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
+
+
+# ── Time range parsing ───────────────────────────────────────────────────────
+
+def parse_time_offset(value):
+    """Parse a time value (seconds, MM:SS, HH:MM:SS) into seconds."""
+    text = (value or "").strip()
+    if not text:
+        raise argparse.ArgumentTypeError("time value cannot be empty")
+
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise argparse.ArgumentTypeError(
+            f"invalid time value '{value}' (expected seconds, MM:SS, or HH:MM:SS)"
+        )
+    if any(not p for p in parts):
+        raise argparse.ArgumentTypeError(
+            f"invalid time value '{value}' (empty time component)"
+        )
+
+    total_seconds = 0.0
+    for idx, part in enumerate(reversed(parts)):
+        if not re.fullmatch(r"\d+(?:\.\d+)?", part):
+            raise argparse.ArgumentTypeError(
+                f"invalid time value '{value}' (must be numeric)"
+            )
+        if idx > 0 and "." in part:
+            raise argparse.ArgumentTypeError(
+                f"invalid time value '{value}' (hours/minutes must be whole numbers)"
+            )
+        total_seconds += float(part) * (60 ** idx)
+
+    return total_seconds
+
+
+def format_seconds_for_yt_dlp(seconds):
+    """Format a seconds value as a compact string for ffmpeg args."""
+    rounded = round(seconds)
+    if abs(seconds - rounded) < 1e-6:
+        return str(int(rounded))
+    return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
+
+def apply_clip_download_opts(ydl_opts, start_seconds=None, end_seconds=None):
+    """Configure yt-dlp to fetch only a requested time window with ffmpeg."""
+    if start_seconds is None and end_seconds is None:
+        return
+
+    ffmpeg_input_args = []
+    if start_seconds is not None:
+        ffmpeg_input_args.extend(["-ss", format_seconds_for_yt_dlp(start_seconds)])
+    if end_seconds is not None:
+        ffmpeg_input_args.extend(["-to", format_seconds_for_yt_dlp(end_seconds)])
+
+    ydl_opts["external_downloader"] = "ffmpeg"
+    ydl_opts["external_downloader_args"] = {"ffmpeg_i": ffmpeg_input_args}
 
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -62,16 +188,25 @@ def check_deps():
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Download and transcribe a YouTube video with faster-whisper",
+        description="Download and transcribe a video URL",
     )
-    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument("url", help="Video URL supported by yt-dlp")
+    parser.add_argument(
+        "--provider",
+        choices=["faster-whisper", "elevenlabs"],
+        default=DEFAULT_PROVIDER,
+        help=f"Transcription backend (default: {DEFAULT_PROVIDER})",
+    )
     parser.add_argument(
         "--model", default=DEFAULT_MODEL,
-        help=f"Whisper model name (default: {DEFAULT_MODEL})",
+        help=(
+            "Transcription model name "
+            f"(default: {DEFAULT_MODEL}, ElevenLabs fallback default: {DEFAULT_ELEVENLABS_MODEL})"
+        ),
     )
     parser.add_argument(
         "--language", default=DEFAULT_LANGUAGE,
-        help=f"Language code (default: {DEFAULT_LANGUAGE})",
+        help=f"Language hint (default: {DEFAULT_LANGUAGE})",
     )
     parser.add_argument(
         "--vault-dir", default=DEFAULT_VAULT_DIR,
@@ -79,15 +214,72 @@ def parse_args():
     )
     parser.add_argument(
         "--diarize", action="store_true",
-        help="Enable speaker diarization (requires pyannote.audio + HuggingFace token)",
+        help=(
+            "Enable speaker diarization "
+            "(local: pyannote + HF token, elevenlabs: built-in diarization)"
+        ),
     )
     parser.add_argument(
         "--speakers", type=int, default=None,
-        help="Expected number of speakers (helps diarization accuracy)",
+        help="Speaker count hint (local diarization target; ElevenLabs max speakers)",
     )
     parser.add_argument(
         "--hf-token", type=str, default=None,
         help="HuggingFace token for pyannote (or set HF_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--elevenlabs-api-key", type=str, default=None,
+        help="ElevenLabs API key (or set ELEVENLABS_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--tag-audio-events", action="store_true",
+        help="Tag non-speech audio events (ElevenLabs only)",
+    )
+    parser.add_argument(
+        "--timestamps-granularity",
+        choices=["none", "word", "character"],
+        default="word",
+        help="Timestamp detail level for ElevenLabs responses (default: word)",
+    )
+    parser.add_argument(
+        "--keyterm",
+        action="append",
+        default=[],
+        help="ElevenLabs keyterm bias phrase (repeat flag for multiple keyterms)",
+    )
+    parser.add_argument(
+        "--entity-detection",
+        action="append",
+        default=[],
+        help="ElevenLabs entity detection type (repeat flag, or comma-separated values)",
+    )
+    parser.add_argument(
+        "--additional-format",
+        action="append",
+        default=[],
+        choices=["docx", "html", "pdf", "segmented_json", "srt", "txt"],
+        help="Ask ElevenLabs for an additional transcript export format",
+    )
+    parser.add_argument(
+        "--use-multi-channel",
+        action="store_true",
+        help="Enable ElevenLabs multi-channel transcription mode",
+    )
+    parser.add_argument(
+        "--name-speakers", action="store_true",
+        help="Interactively name speakers using video frame previews (implies --diarize)",
+    )
+    parser.add_argument(
+        "--start",
+        type=parse_time_offset,
+        default=None,
+        help="Start offset (seconds, MM:SS, or HH:MM:SS)",
+    )
+    parser.add_argument(
+        "--end",
+        type=parse_time_offset,
+        default=None,
+        help="End offset (seconds, MM:SS, or HH:MM:SS)",
     )
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument(
@@ -98,7 +290,11 @@ def parse_args():
         "--output", type=str, default=None,
         help="Explicit output directory (overrides vault)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    start_for_validation = args.start if args.start is not None else 0.0
+    if args.end is not None and args.end <= start_for_validation:
+        parser.error("--end must be greater than --start (or greater than 0 if --start is omitted)")
+    return args
 
 
 # ── YouTube metadata and download ────────────────────────────────────────────
@@ -154,11 +350,16 @@ def fetch_metadata(url):
     return meta
 
 
-def download_audio(url, tmp_dir):
-    """Download audio from YouTube and convert to 16kHz mono WAV."""
+def download_audio(url, tmp_dir, start_seconds=None, end_seconds=None):
+    """Download best-quality audio and return local file path."""
     import yt_dlp
 
-    print(f"\n{DIM}Downloading audio...{RESET}", file=sys.stderr)
+    if start_seconds is not None or end_seconds is not None:
+        start_label = format_ts_short(start_seconds or 0.0)
+        end_label = format_ts_short(end_seconds) if end_seconds is not None else "end"
+        print(f"\n{DIM}Downloading audio clip ({start_label} -> {end_label})...{RESET}", file=sys.stderr)
+    else:
+        print(f"\n{DIM}Downloading audio...{RESET}", file=sys.stderr)
 
     raw_audio = str(Path(tmp_dir) / "audio.%(ext)s")
     ydl_opts = {
@@ -170,6 +371,7 @@ def download_audio(url, tmp_dir):
         "js_runtimes": {"node": {}},
         "remote_components": ["ejs:github"],
     }
+    apply_clip_download_opts(ydl_opts, start_seconds, end_seconds)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
@@ -179,15 +381,17 @@ def download_audio(url, tmp_dir):
     if not downloaded:
         print(f"{RED}Error: no audio file downloaded{RESET}", file=sys.stderr)
         sys.exit(1)
-    raw_path = downloaded[0]
+    return str(downloaded[0])
 
-    # Convert to 16kHz mono WAV for faster-whisper
+
+def convert_audio_for_faster_whisper(input_path, tmp_dir):
+    """Convert source audio to 16kHz mono WAV for local faster-whisper."""
     wav_path = str(Path(tmp_dir) / "audio_16k.wav")
     print(f"{DIM}Converting to 16kHz WAV...{RESET}", file=sys.stderr)
 
     result = subprocess.run(
         [
-            "ffmpeg", "-y", "-i", str(raw_path),
+            "ffmpeg", "-y", "-i", str(input_path),
             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
             wav_path, "-loglevel", "error",
         ],
@@ -198,6 +402,42 @@ def download_audio(url, tmp_dir):
         sys.exit(1)
 
     return wav_path
+
+
+def download_video(url, tmp_dir, start_seconds=None, end_seconds=None):
+    """Download lowest-quality video stream for frame extraction."""
+    import yt_dlp
+
+    if start_seconds is not None or end_seconds is not None:
+        start_label = format_ts_short(start_seconds or 0.0)
+        end_label = format_ts_short(end_seconds) if end_seconds is not None else "end"
+        print(
+            f"\n{DIM}Downloading clipped video for speaker frames ({start_label} -> {end_label})...{RESET}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"\n{DIM}Downloading video for speaker frames...{RESET}", file=sys.stderr)
+
+    video_path = str(Path(tmp_dir) / "video.%(ext)s")
+    ydl_opts = {
+        "format": "worstvideo[ext=mp4]/worstvideo",
+        "outtmpl": video_path,
+        "quiet": True,
+        "no_warnings": True,
+        "cookiesfrombrowser": ("chrome",),
+        "js_runtimes": {"node": {}},
+        "remote_components": ["ejs:github"],
+    }
+    apply_clip_download_opts(ydl_opts, start_seconds, end_seconds)
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    downloaded = list(Path(tmp_dir).glob("video.*"))
+    if not downloaded:
+        print(f"{RED}Warning: could not download video for speaker frames{RESET}", file=sys.stderr)
+        return None
+    return str(downloaded[0])
 
 
 # ── Transcription ────────────────────────────────────────────────────────────
@@ -220,7 +460,260 @@ def format_ts_short(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def transcribe(wav_path, model_name, language):
+def resolve_model_name(provider, model_name):
+    """Select provider-specific default model when model is not explicitly set."""
+    if provider == "elevenlabs" and model_name == DEFAULT_MODEL:
+        return DEFAULT_ELEVENLABS_MODEL
+    return model_name
+
+
+def normalize_elevenlabs_language_code(language):
+    """Map common 2-letter codes to ElevenLabs 3-letter language codes."""
+    if not language:
+        return None
+    code = language.strip().lower()
+    if "-" in code:
+        code = code.split("-", 1)[0]
+    if code in ("auto", "detect", "none", "null"):
+        return None
+    if len(code) == 3:
+        return code
+    return ELEVENLABS_LANGUAGE_MAP.get(code, code)
+
+
+def to_plain_data(value):
+    """Recursively convert SDK response objects into plain dict/list types."""
+    if isinstance(value, dict):
+        return {k: to_plain_data(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_plain_data(v) for v in value]
+    if hasattr(value, "model_dump"):
+        return to_plain_data(value.model_dump())
+    if hasattr(value, "dict"):
+        return to_plain_data(value.dict())
+    if hasattr(value, "__dict__"):
+        return to_plain_data(vars(value))
+    return value
+
+
+def split_csv_args(values):
+    """Split repeated/CSV CLI args into a flat list of non-empty strings."""
+    parsed = []
+    for value in values or []:
+        parts = [p.strip() for p in value.split(",")]
+        parsed.extend(p for p in parts if p)
+    return parsed
+
+
+def normalize_elevenlabs_keyterms(keyterms):
+    """Normalize keyterm list for ElevenLabs request."""
+    parsed = split_csv_args(keyterms)
+    if len(parsed) > 100:
+        print(f"{RED}ElevenLabs keyterms limit is 100 entries.{RESET}", file=sys.stderr)
+        sys.exit(1)
+    for term in parsed:
+        if len(term) > 50:
+            print(
+                f"{RED}Keyterm too long (max 50 chars):{RESET} {term[:80]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    return parsed or None
+
+
+def normalize_elevenlabs_entity_detection(entity_detection):
+    """Normalize entity_detection value to API-supported shapes."""
+    parsed = split_csv_args(entity_detection)
+    if not parsed:
+        return None
+    if len(parsed) == 1:
+        return parsed[0]
+    return parsed
+
+
+def normalize_elevenlabs_additional_formats(formats):
+    """Normalize additional export format request values."""
+    parsed = split_csv_args(formats)
+    if not parsed:
+        return None
+    return [{"format": fmt} for fmt in parsed]
+
+
+def collect_entities_from_payload(payload):
+    """Collect detected entities from single or multi-channel payloads."""
+    entities = []
+    top_level = payload.get("entities")
+    if isinstance(top_level, list):
+        entities.extend(top_level)
+
+    transcripts = payload.get("transcripts")
+    if isinstance(transcripts, list):
+        for chunk in transcripts:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_entities = chunk.get("entities")
+            if isinstance(chunk_entities, list):
+                entities.extend(chunk_entities)
+
+    return entities
+
+
+def build_transcription_from_elevenlabs_words(
+    words,
+    fallback_text,
+    default_speaker=None,
+    channel_index=None,
+):
+    """Convert ElevenLabs word events into this CLI's segment structure."""
+    transcription = []
+    current = None
+
+    def flush():
+        nonlocal current
+        if not current:
+            return
+
+        text = normalize_transcript_text("".join(current["text_parts"]))
+        if text:
+            from_ms = round(current["start_s"] * 1000)
+            to_ms = round(current["end_s"] * 1000)
+            seg = {
+                "timestamps": {
+                    "from": format_ts(current["start_s"]),
+                    "to": format_ts(current["end_s"]),
+                },
+                "offsets": {
+                    "from": from_ms,
+                    "to": to_ms,
+                },
+                "text": text,
+                "words": current["words"],
+                "start_seconds": current["start_s"],
+                "end_seconds": current["end_s"],
+            }
+            if current["speaker"]:
+                seg["speaker"] = current["speaker"]
+            if channel_index is not None:
+                seg["channel_index"] = channel_index
+            transcription.append(seg)
+
+        current = None
+
+    pause_split_s = 1.6
+    for token in words:
+        token_type = token.get("type", "word")
+        token_text = token.get("text", "")
+        token_speaker = token.get("speaker_id") or default_speaker
+
+        token_start = token.get("start")
+        token_end = token.get("end")
+        token_start = float(token_start) if token_start is not None else None
+        token_end = float(token_end) if token_end is not None else token_start
+
+        if token_type == "audio_event":
+            event = (token_text or "").strip()
+            token_text = f"[{event}]" if event else ""
+
+        if current is None and token_type == "spacing":
+            continue
+
+        if current and token_type != "spacing":
+            speaker_changed = (
+                current["speaker"] and token_speaker and current["speaker"] != token_speaker
+            )
+            long_pause = (
+                token_start is not None
+                and current["end_s"] is not None
+                and (token_start - current["end_s"]) > pause_split_s
+            )
+            if speaker_changed or long_pause:
+                flush()
+
+        if current is None:
+            start_s = token_start if token_start is not None else 0.0
+            end_s = token_end if token_end is not None else start_s
+            current = {
+                "speaker": token_speaker,
+                "start_s": start_s,
+                "end_s": end_s,
+                "text_parts": [],
+                "words": [],
+            }
+
+        if current["speaker"] is None and token_speaker:
+            current["speaker"] = token_speaker
+
+        if token_text:
+            current["text_parts"].append(token_text)
+
+        if token_type == "word":
+            clean_word = (token_text or "").strip()
+            if clean_word and token_start is not None and token_end is not None:
+                word = {
+                    "word": clean_word,
+                    "start": round(token_start * 1000),
+                    "end": round(token_end * 1000),
+                }
+                if token_speaker:
+                    word["speaker"] = token_speaker
+                if channel_index is not None:
+                    word["channel_index"] = channel_index
+                current["words"].append(word)
+
+        if token_end is not None:
+            current["end_s"] = token_end
+
+    flush()
+
+    if transcription:
+        return transcription
+
+    text = normalize_transcript_text(fallback_text)
+    if not text:
+        return []
+
+    fallback_seg = {
+        "timestamps": {"from": format_ts(0), "to": format_ts(0)},
+        "offsets": {"from": 0, "to": 0},
+        "text": text,
+        "words": [],
+        "start_seconds": 0.0,
+        "end_seconds": 0.0,
+    }
+    if default_speaker:
+        fallback_seg["speaker"] = default_speaker
+    if channel_index is not None:
+        fallback_seg["channel_index"] = channel_index
+    return [fallback_seg]
+
+
+def speaker_segments_from_transcription(transcription):
+    """Build diarization-like segments from speaker-labeled transcript segments."""
+    speaker_segments = []
+    for seg in transcription:
+        speaker = seg.get("speaker")
+        if not speaker:
+            continue
+
+        start_s = seg.get("start_seconds")
+        end_s = seg.get("end_seconds")
+        if start_s is None:
+            start_s = seg.get("offsets", {}).get("from", 0) / 1000.0
+        if end_s is None:
+            end_s = seg.get("offsets", {}).get("to", 0) / 1000.0
+        if end_s <= start_s:
+            continue
+
+        speaker_segments.append({
+            "start": start_s,
+            "end": end_s,
+            "speaker": speaker,
+        })
+
+    return speaker_segments
+
+
+def transcribe_faster_whisper(wav_path, model_name, language):
     """Transcribe audio with faster-whisper, returning the result dict."""
     from faster_whisper import WhisperModel
 
@@ -273,6 +766,7 @@ def transcribe(wav_path, model_name, language):
 
     result = {
         "params": {
+            "provider": "faster-whisper",
             "model": model_name,
             "language": language,
         },
@@ -290,6 +784,155 @@ def transcribe(wav_path, model_name, language):
     )
 
     return result
+
+
+def transcribe_elevenlabs(
+    audio_path,
+    model_name,
+    language,
+    diarize_enabled=False,
+    tag_audio_events=False,
+    timestamps_granularity="word",
+    keyterms=None,
+    entity_detection=None,
+    additional_formats=None,
+    num_speakers=None,
+    use_multi_channel=False,
+    api_key=None,
+):
+    """Transcribe audio with ElevenLabs Speech-to-Text."""
+    from elevenlabs.client import ElevenLabs
+
+    key = api_key or os.environ.get("ELEVENLABS_API_KEY")
+    if not key:
+        print(f"{RED}ElevenLabs API key is required.{RESET}", file=sys.stderr)
+        print(
+            f"{DIM}Pass --elevenlabs-api-key or set ELEVENLABS_API_KEY env var.{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    language_code = normalize_elevenlabs_language_code(language)
+    print(f"\n{DIM}Calling ElevenLabs STT model: {model_name}...{RESET}", file=sys.stderr)
+    client = ElevenLabs(api_key=key)
+
+    request_kwargs = {
+        "model_id": model_name,
+        "tag_audio_events": tag_audio_events,
+        "diarize": diarize_enabled,
+        "timestamps_granularity": timestamps_granularity,
+        "use_multi_channel": use_multi_channel,
+    }
+    if language_code:
+        request_kwargs["language_code"] = language_code
+    if keyterms:
+        request_kwargs["keyterms"] = keyterms
+    if entity_detection is not None:
+        request_kwargs["entity_detection"] = entity_detection
+    if additional_formats:
+        request_kwargs["additional_formats"] = additional_formats
+    if num_speakers is not None:
+        request_kwargs["num_speakers"] = num_speakers
+
+    with open(audio_path, "rb") as audio_file:
+        response = client.speech_to_text.convert(file=audio_file, **request_kwargs)
+
+    payload = to_plain_data(response)
+    if not isinstance(payload, dict):
+        print(
+            f"{RED}Unexpected ElevenLabs response shape: {type(payload).__name__}{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    transcription = []
+
+    multichannel = payload.get("transcripts")
+    if isinstance(multichannel, list):
+        for chunk in multichannel:
+            if not isinstance(chunk, dict):
+                continue
+            channel_idx = chunk.get("channel_index")
+            speaker = f"channel_{channel_idx}" if channel_idx is not None else None
+            transcription.extend(
+                build_transcription_from_elevenlabs_words(
+                    words=chunk.get("words") or [],
+                    fallback_text=chunk.get("text", ""),
+                    default_speaker=speaker,
+                    channel_index=channel_idx,
+                )
+            )
+        transcription.sort(key=lambda seg: seg.get("start_seconds", 0.0))
+    else:
+        transcription = build_transcription_from_elevenlabs_words(
+            words=payload.get("words") or [],
+            fallback_text=payload.get("text", ""),
+        )
+
+    for seg in transcription:
+        print(
+            f"  [{format_ts(seg['start_seconds'])} -> {format_ts(seg['end_seconds'])}] {seg['text']}",
+            file=sys.stderr,
+        )
+
+    duration = max((seg.get("end_seconds", 0) for seg in transcription), default=0)
+    entities = collect_entities_from_payload(payload)
+    additional_formats_response = payload.get("additional_formats")
+    if not additional_formats_response and isinstance(multichannel, list):
+        per_channel_formats = []
+        for chunk in multichannel:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_formats = chunk.get("additional_formats")
+            if not chunk_formats:
+                continue
+            per_channel_formats.append({
+                "channel_index": chunk.get("channel_index"),
+                "additional_formats": chunk_formats,
+            })
+        additional_formats_response = per_channel_formats or None
+
+    language_code = payload.get("language_code")
+    language_probability = payload.get("language_probability")
+    if not language_code and isinstance(multichannel, list) and multichannel:
+        language_code = multichannel[0].get("language_code")
+    if language_probability is None and isinstance(multichannel, list) and multichannel:
+        language_probability = multichannel[0].get("language_probability")
+
+    result = {
+        "params": {
+            "provider": "elevenlabs",
+            "model": model_name,
+            "language": language,
+            "timestamps_granularity": timestamps_granularity,
+            "tag_audio_events": tag_audio_events,
+            "diarize": diarize_enabled,
+            "use_multi_channel": use_multi_channel,
+        },
+        "result": {
+            "language": language_code,
+            "language_probability": language_probability,
+            "duration": duration,
+            "transcription_id": payload.get("transcription_id"),
+            "entities": entities,
+        },
+        "transcription": transcription,
+    }
+    if additional_formats_response:
+        result["result"]["additional_formats"] = additional_formats_response
+    if keyterms:
+        result["params"]["keyterms"] = keyterms
+    if entity_detection is not None:
+        result["params"]["entity_detection"] = entity_detection
+    if additional_formats:
+        result["params"]["additional_formats"] = additional_formats
+    if num_speakers is not None:
+        result["params"]["num_speakers"] = num_speakers
+
+    print(
+        f"\n{GREEN}Transcribed {len(transcription)} segments{RESET}",
+        file=sys.stderr,
+    )
+    return result, payload
 
 
 # ── Speaker diarization ──────────────────────────────────────────────────────
@@ -360,6 +1003,211 @@ def assign_speakers(result, speaker_segments):
     return result
 
 
+def find_speaker_timestamps(speaker_segments, max_samples=3):
+    """Find up to max_samples representative timestamps per speaker.
+
+    Picks midpoints of the longest speaking turns, sorted chronologically.
+    Returns {speaker: [ts1, ts2, ...]}
+    """
+    from collections import defaultdict
+    turns = defaultdict(list)
+    for seg in speaker_segments:
+        turns[seg["speaker"]].append((seg["end"] - seg["start"], seg["start"], seg["end"]))
+
+    timestamps = {}
+    for speaker, speaker_turns in turns.items():
+        # Sort by duration descending, take top N
+        top = sorted(speaker_turns, key=lambda t: t[0], reverse=True)[:max_samples]
+        # Sort those chronologically by start time
+        top.sort(key=lambda t: t[1])
+        timestamps[speaker] = [(start + end) / 2.0 for _, start, end in top]
+
+    return timestamps
+
+
+def extract_speaker_frames(video_path, speaker_timestamps, tmp_dir):
+    """Extract sample frames for each speaker and tile into a horizontal strip.
+
+    Returns {speaker: (composite_image_path, [timestamps])}
+    """
+    frames = {}
+    for speaker, ts_list in speaker_timestamps.items():
+        # Extract individual frames
+        individual = []
+        for i, ts in enumerate(ts_list):
+            frame_path = str(Path(tmp_dir) / f"frame_{speaker}_{i}.png")
+            r = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", f"{ts:.3f}",
+                    "-i", video_path,
+                    "-frames:v", "1",
+                    "-vf", "scale=320:-1",
+                    frame_path,
+                    "-loglevel", "error",
+                ],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and Path(frame_path).exists():
+                individual.append(frame_path)
+
+        if not individual:
+            print(f"  {DIM}Could not extract frames for {speaker}{RESET}", file=sys.stderr)
+            continue
+
+        # Tile into horizontal strip if multiple frames
+        if len(individual) == 1:
+            frames[speaker] = (individual[0], ts_list)
+        else:
+            composite = str(Path(tmp_dir) / f"strip_{speaker}.png")
+            inputs = []
+            for p in individual:
+                inputs.extend(["-i", p])
+            r = subprocess.run(
+                [
+                    "ffmpeg", "-y", *inputs,
+                    "-filter_complex", f"hstack=inputs={len(individual)}",
+                    composite,
+                    "-loglevel", "error",
+                ],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and Path(composite).exists():
+                frames[speaker] = (composite, ts_list)
+            else:
+                # Fallback to first frame if tiling fails
+                frames[speaker] = (individual[0], ts_list)
+
+    return frames
+
+
+def rename_speakers(result, name_map):
+    """Replace generic SPEAKER_XX labels with user-provided names."""
+    if not name_map:
+        return result
+    for seg in result["transcription"]:
+        if seg.get("speaker") in name_map:
+            seg["speaker"] = name_map[seg["speaker"]]
+        for word in seg.get("words", []):
+            if word.get("speaker") in name_map:
+                word["speaker"] = name_map[word["speaker"]]
+    return result
+
+
+# ── Interactive speaker identification ────────────────────────────────────────
+
+def supports_kitty_graphics():
+    """Check if terminal supports Kitty graphics protocol."""
+    term = os.environ.get("TERM_PROGRAM", "").lower()
+    return term in ("ghostty", "kitty", "wezterm")
+
+
+def display_image_kitty(image_path):
+    """Display a PNG image inline using the Kitty graphics protocol."""
+    with open(image_path, "rb") as f:
+        encoded = base64.standard_b64encode(f.read())
+
+    chunk_size = 4096
+    w = sys.stdout.buffer.write
+    for i in range(0, len(encoded), chunk_size):
+        chunk = encoded[i:i + chunk_size]
+        is_last = i + chunk_size >= len(encoded)
+        if i == 0:
+            w(f"\x1b_Ga=T,f=100,m={0 if is_last else 1};".encode("ascii"))
+        else:
+            w(f"\x1b_Gm={0 if is_last else 1};".encode("ascii"))
+        w(chunk)
+        w(b"\x1b\\")
+    sys.stdout.buffer.flush()
+    print("", file=sys.stderr)
+
+
+def display_image_fallback(image_path):
+    """Open image in macOS Preview as a fallback."""
+    subprocess.run(["open", image_path], check=False)
+    print(f"  {DIM}(Opened in Preview){RESET}", file=sys.stderr)
+
+
+def find_sample_text(speaker, result):
+    """Find a short sample transcript line for a speaker."""
+    for seg in result["transcription"]:
+        if seg.get("speaker") == speaker:
+            text = seg["text"].strip()
+            if len(text) > 80:
+                text = text[:77] + "..."
+            return text
+    return None
+
+
+def make_hyperlink(url, text):
+    """Create an OSC 8 clickable hyperlink for terminal display."""
+    return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
+
+
+def prompt_speaker_names(speaker_segments, frames, result, video_url=None, time_offset=0.0):
+    """Display speaker frames with timestamps and prompt user for names."""
+    seen = set()
+    speakers_ordered = []
+    for seg in speaker_segments:
+        if seg["speaker"] not in seen:
+            seen.add(seg["speaker"])
+            speakers_ordered.append(seg["speaker"])
+
+    use_kitty = supports_kitty_graphics()
+    name_map = {}
+
+    print(f"\n{BOLD}Speaker Identification{RESET}", file=sys.stderr)
+    print(f"{DIM}Type a name for each speaker (Enter to keep default){RESET}\n", file=sys.stderr)
+
+    for speaker in speakers_ordered:
+        print(f"  {CYAN}{speaker}{RESET}", file=sys.stderr)
+
+        if speaker in frames:
+            image_path, ts_list = frames[speaker]
+            # Show timestamps as clickable YouTube links
+            if video_url:
+                ts_links = []
+                for t in ts_list:
+                    absolute_t = t + (time_offset or 0.0)
+                    label = format_ts_short(absolute_t)
+                    yt_url = (
+                        f"{video_url}&t={int(absolute_t)}s"
+                        if "?" in video_url
+                        else f"{video_url}?t={int(absolute_t)}s"
+                    )
+                    ts_links.append(make_hyperlink(yt_url, label))
+                print(f"  {DIM}Samples at: {', '.join(ts_links)}{RESET}", file=sys.stderr)
+            else:
+                ts_strs = [format_ts_short(t) for t in ts_list]
+                print(f"  {DIM}Samples at: {', '.join(ts_strs)}{RESET}", file=sys.stderr)
+
+            if use_kitty:
+                display_image_kitty(image_path)
+            else:
+                display_image_fallback(image_path)
+        else:
+            print(f"  {DIM}(no frame available){RESET}", file=sys.stderr)
+
+        # Show a sample transcript line
+        sample = find_sample_text(speaker, result)
+        if sample:
+            print(f"  {DIM}\"{sample}\"{RESET}", file=sys.stderr)
+
+        try:
+            name = input(f"  Name for {speaker} [Enter to skip]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{DIM}Skipping remaining speakers{RESET}", file=sys.stderr)
+            break
+
+        if name:
+            name_map[speaker] = name
+            print(f"  {GREEN}{speaker} -> {name}{RESET}\n", file=sys.stderr)
+        else:
+            print(f"  {DIM}Keeping {speaker}{RESET}\n", file=sys.stderr)
+
+    return name_map
+
+
 # ── Output helpers ───────────────────────────────────────────────────────────
 
 def resolve_output_dir(args):
@@ -385,18 +1233,140 @@ def sanitize_filename(title):
 
 # ── Obsidian Markdown generation ─────────────────────────────────────────────
 
+def normalize_transcript_text(text):
+    """Normalize transcript spacing to keep markdown paragraphs clean."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def split_paragraphs(text, target_chars=420, max_chars=620):
+    """Split text into readable paragraph chunks around sentence boundaries."""
+    text = normalize_transcript_text(text)
+    if not text:
+        return []
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if not sentences:
+        return [text]
+
+    paragraphs = []
+    current = []
+    current_len = 0
+
+    def flush_current():
+        nonlocal current, current_len
+        if current:
+            paragraphs.append(" ".join(current))
+            current = []
+            current_len = 0
+
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            flush_current()
+            words = sentence.split()
+            chunk = []
+            chunk_len = 0
+            for word in words:
+                addition = len(word) if not chunk else len(word) + 1
+                if chunk and chunk_len + addition > max_chars:
+                    paragraphs.append(" ".join(chunk))
+                    chunk = [word]
+                    chunk_len = len(word)
+                else:
+                    chunk.append(word)
+                    chunk_len += addition
+            if chunk:
+                paragraphs.append(" ".join(chunk))
+            continue
+
+        addition = len(sentence) if not current else len(sentence) + 1
+        if current and current_len + addition > target_chars:
+            flush_current()
+        current.append(sentence)
+        current_len += addition
+
+    flush_current()
+    return paragraphs
+
+
+def build_transcript_blocks(transcription, merge_gap_s=1.6):
+    """Merge adjacent same-speaker segments into larger blocks."""
+    blocks = []
+    for seg in transcription:
+        text = normalize_transcript_text(seg.get("text", ""))
+        if not text:
+            continue
+
+        start = seg.get("start_seconds")
+        end = seg.get("end_seconds")
+        if start is None:
+            start = seg["offsets"]["from"] / 1000.0
+        if end is None:
+            end = seg["offsets"]["to"] / 1000.0
+
+        speaker = seg.get("speaker")
+        if blocks:
+            prev = blocks[-1]
+            gap = start - prev["end"]
+            if prev["speaker"] == speaker and gap <= merge_gap_s:
+                prev["text"] = f"{prev['text']} {text}"
+                prev["end"] = end
+                continue
+
+        blocks.append({
+            "speaker": speaker,
+            "start": start,
+            "end": end,
+            "text": text,
+        })
+
+    return blocks
+
+
+def yaml_quote(value):
+    """Return a double-quoted YAML-safe scalar."""
+    return json.dumps("" if value is None else str(value), ensure_ascii=False)
+
+
 def generate_markdown(meta, result, model_name):
     """Build an Obsidian-compatible Markdown document from transcript data."""
     lines = []
+    params = result.get("params", {})
+    result_meta = result.get("result", {})
+    entities = result_meta.get("entities") or []
 
     # YAML frontmatter
     lines.append("---")
-    lines.append(f"title: \"{meta['title']}\"")
+    lines.append(f"title: {yaml_quote(meta['title'])}")
     lines.append(f"url: {meta['url']}")
-    lines.append(f"channel: \"{meta['channel']}\"")
+    lines.append(f"channel: {yaml_quote(meta['channel'])}")
     lines.append(f"date: {meta['date']}")
     lines.append(f"duration: {meta['duration_str']}")
-    lines.append(f"model: {model_name}")
+    lines.append(f"model: {yaml_quote(model_name)}")
+    if params.get("provider"):
+        lines.append(f"provider: {yaml_quote(params.get('provider'))}")
+    if params.get("clip_start_seconds") is not None:
+        lines.append(f"clip_start_seconds: {format_seconds_for_yt_dlp(params['clip_start_seconds'])}")
+    if params.get("clip_end_seconds") is not None:
+        lines.append(f"clip_end_seconds: {format_seconds_for_yt_dlp(params['clip_end_seconds'])}")
+    if params.get("clip_start_seconds") is not None and params.get("clip_end_seconds") is not None:
+        clip_duration = max(0.0, params["clip_end_seconds"] - params["clip_start_seconds"])
+        lines.append(f"clip_duration_seconds: {format_seconds_for_yt_dlp(clip_duration)}")
+    if result_meta.get("transcription_id"):
+        lines.append(f"transcription_id: {yaml_quote(result_meta.get('transcription_id'))}")
+    lines.append(f"entity_count: {len(entities)}")
+    if entities:
+        lines.append("entities:")
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            text = yaml_quote(entity.get("text", ""))
+            entity_type = yaml_quote(entity.get("entity_type", "unknown"))
+            start_char = entity.get("start_char", 0)
+            end_char = entity.get("end_char", 0)
+            lines.append(f"  - text: {text}")
+            lines.append(f"    type: {entity_type}")
+            lines.append(f"    start_char: {start_char}")
+            lines.append(f"    end_char: {end_char}")
     lines.append("tags:")
     lines.append("  - transcript")
     lines.append("  - youtube")
@@ -407,23 +1377,69 @@ def generate_markdown(meta, result, model_name):
     lines.append(f"# {meta['title']}")
     lines.append("")
 
-    # Transcript sections
-    has_speakers = any(seg.get("speaker") for seg in result["transcription"])
-    prev_speaker = None
+    transcription = result["transcription"]
+    if not transcription:
+        lines.append("_No transcript segments generated._")
+        lines.append("")
+        return "\n".join(lines)
 
-    for seg in result["transcription"]:
-        start = seg["start_seconds"]
-        end = seg["end_seconds"]
-        speaker = seg.get("speaker")
-        text = seg["text"].strip()
+    blocks = build_transcript_blocks(transcription)
+    if not blocks:
+        lines.append("_No transcript text generated._")
+        lines.append("")
+        return "\n".join(lines)
 
-        if has_speakers and speaker and speaker != prev_speaker:
+    speakers = [b["speaker"] for b in blocks if b.get("speaker")]
+    unique_speakers = list(dict.fromkeys(speakers))
+    single_speaker_mode = len(unique_speakers) <= 1
+
+    lines.append(
+        f"_Transcript span: {format_ts_short(blocks[0]['start'])} - {format_ts_short(blocks[-1]['end'])}. "
+        "Word-level timestamps are in the companion JSON._"
+    )
+    lines.append("")
+
+    if entities:
+        lines.append("## Detected Entities")
+        lines.append("")
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            lines.append(
+                f"- {entity.get('entity_type', 'unknown')}: "
+                f"\"{entity.get('text', '').strip()}\" "
+                f"(chars {entity.get('start_char', 0)}-{entity.get('end_char', 0)})"
+            )
+        lines.append("")
+
+    lines.append("## Transcript")
+    lines.append("")
+
+    if single_speaker_mode:
+        speaker = unique_speakers[0] if unique_speakers else None
+        if speaker:
             lines.append(f"### {speaker}")
             lines.append("")
-            prev_speaker = speaker
 
-        lines.append(f"**{format_ts_short(start)}** {text}")
-        lines.append("")
+        for block in blocks:
+            for paragraph in split_paragraphs(block["text"]):
+                lines.append(paragraph)
+                lines.append("")
+    else:
+        prev_speaker = None
+        for block in blocks:
+            speaker = block.get("speaker") or "Unknown Speaker"
+            if speaker != prev_speaker:
+                lines.append(f"### {speaker}")
+                lines.append("")
+                prev_speaker = speaker
+
+            lines.append(f"_{format_ts_short(block['start'])} - {format_ts_short(block['end'])}_")
+            lines.append("")
+
+            for paragraph in split_paragraphs(block["text"]):
+                lines.append(paragraph)
+                lines.append("")
 
     return "\n".join(lines)
 
@@ -432,8 +1448,23 @@ def generate_markdown(meta, result, model_name):
 
 def main():
     args = parse_args()
-    check_deps()
+    model_name = resolve_model_name(args.provider, args.model)
+    check_deps(args.provider, diarize_enabled=args.diarize or args.name_speakers)
     print(f"{BOLD}{CYAN}yt-transcribe{RESET}", file=sys.stderr)
+    print(f"{DIM}Provider: {args.provider} | Model: {model_name}{RESET}", file=sys.stderr)
+    if args.start is not None or args.end is not None:
+        clip_start = format_ts_short(args.start or 0.0)
+        clip_end = format_ts_short(args.end) if args.end is not None else "end"
+        print(f"{DIM}Clip: {clip_start} -> {clip_end}{RESET}", file=sys.stderr)
+
+    elevenlabs_api_key = args.elevenlabs_api_key or os.environ.get("ELEVENLABS_API_KEY")
+    if args.provider == "elevenlabs" and not elevenlabs_api_key:
+        print(f"{RED}ElevenLabs API key is required for --provider elevenlabs.{RESET}", file=sys.stderr)
+        print(
+            f"{DIM}Pass --elevenlabs-api-key or set ELEVENLABS_API_KEY env var.{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     meta = fetch_metadata(args.url)
 
@@ -441,10 +1472,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     base_name = sanitize_filename(meta["title"])
 
+    # --name-speakers implies --diarize
+    if args.name_speakers:
+        args.diarize = True
+
     # Resolve HF token for diarization
     hf_token = None
-    if args.diarize:
-        import os
+    if args.diarize and args.provider == "faster-whisper":
         hf_token = args.hf_token or os.environ.get("HF_TOKEN")
         if not hf_token:
             print(f"{RED}Diarization requires a HuggingFace token.{RESET}", file=sys.stderr)
@@ -453,17 +1487,77 @@ def main():
             sys.exit(1)
 
     tmp_dir = tempfile.mkdtemp(prefix="yt_transcribe_")
+    raw_provider_payload = None
     try:
-        wav_path = download_audio(args.url, tmp_dir)
-        result = transcribe(wav_path, args.model, args.language)
-        if args.diarize:
-            speaker_segments = diarize(wav_path, hf_token, args.speakers)
-            result = assign_speakers(result, speaker_segments)
+        source_audio_path = download_audio(
+            args.url,
+            tmp_dir,
+            start_seconds=args.start,
+            end_seconds=args.end,
+        )
+
+        speaker_segments = None
+        if args.provider == "elevenlabs":
+            keyterms = normalize_elevenlabs_keyterms(args.keyterm)
+            entity_detection = normalize_elevenlabs_entity_detection(args.entity_detection)
+            additional_formats = normalize_elevenlabs_additional_formats(args.additional_format)
+            result, raw_provider_payload = transcribe_elevenlabs(
+                audio_path=source_audio_path,
+                model_name=model_name,
+                language=args.language,
+                diarize_enabled=args.diarize,
+                tag_audio_events=args.tag_audio_events,
+                timestamps_granularity=args.timestamps_granularity,
+                keyterms=keyterms,
+                entity_detection=entity_detection,
+                additional_formats=additional_formats,
+                num_speakers=args.speakers,
+                use_multi_channel=args.use_multi_channel,
+                api_key=elevenlabs_api_key,
+            )
+            if args.diarize:
+                speaker_segments = speaker_segments_from_transcription(result["transcription"])
+        else:
+            wav_path = convert_audio_for_faster_whisper(source_audio_path, tmp_dir)
+            result = transcribe_faster_whisper(wav_path, model_name, args.language)
+            if args.diarize:
+                speaker_segments = diarize(wav_path, hf_token, args.speakers)
+                result = assign_speakers(result, speaker_segments)
+
+        if args.name_speakers and speaker_segments and sys.stdin.isatty():
+            video_path = download_video(
+                args.url,
+                tmp_dir,
+                start_seconds=args.start,
+                end_seconds=args.end,
+            )
+            if video_path:
+                timestamps = find_speaker_timestamps(speaker_segments)
+                frames = extract_speaker_frames(video_path, timestamps, tmp_dir)
+                if frames:
+                    name_map = prompt_speaker_names(
+                        speaker_segments,
+                        frames,
+                        result,
+                        video_url=args.url,
+                        time_offset=(args.start or 0.0),
+                    )
+                    if name_map:
+                        result = rename_speakers(result, name_map)
+                else:
+                    print(f"{DIM}Could not extract speaker frames, skipping naming{RESET}", file=sys.stderr)
+            else:
+                print(f"{DIM}Could not download video, skipping speaker naming{RESET}", file=sys.stderr)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    if args.start is not None or args.end is not None:
+        result["params"]["clip_start_seconds"] = args.start if args.start is not None else 0.0
+        if args.end is not None:
+            result["params"]["clip_end_seconds"] = args.end
+
     # Generate markdown (needs start_seconds/end_seconds)
-    md_content = generate_markdown(meta, result, args.model)
+    md_content = generate_markdown(meta, result, model_name)
 
     # Clean internal fields before saving JSON
     for seg in result["transcription"]:
@@ -475,6 +1569,12 @@ def main():
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent="\t", ensure_ascii=False)
     print(f"\n{GREEN}Wrote JSON:{RESET} {json_path}", file=sys.stderr)
+
+    if raw_provider_payload is not None:
+        raw_path = output_dir / f"{base_name}.elevenlabs.raw.json"
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_provider_payload, f, indent="\t", ensure_ascii=False)
+        print(f"{GREEN}Wrote ElevenLabs raw JSON:{RESET} {raw_path}", file=sys.stderr)
 
     # Save Markdown
     md_path = output_dir / f"{base_name}.md"
